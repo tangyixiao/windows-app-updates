@@ -9,9 +9,9 @@ namespace WindowsAppUpdates;
 
 public sealed record PackageUpdate(string Name, string Id, string Installed, string Available);
 
-public sealed record CommandResult(int ExitCode, string Output)
+public sealed record CommandResult(int? ExitCode, string Output, bool NeedsReview = false)
 {
-    public string ExitCodeText => $"0x{ExitCode:X8}";
+    public string ExitCodeText => ExitCode is int code ? $"0x{code:X8}" : "未运行";
 }
 
 public interface IUpdateProvider
@@ -24,13 +24,19 @@ public sealed record ScanResult(IReadOnlyList<PackageUpdate> Packages, string Ou
 
 public sealed partial class WinGet : IUpdateProvider
 {
+    private readonly Func<string[], CancellationToken, InstallerProcessGroup?, Task<CommandResult>> run;
+
+    public WinGet() : this(RunAsync) { }
+
+    internal WinGet(Func<string[], CancellationToken, InstallerProcessGroup?, Task<CommandResult>> run) => this.run = run;
+
     public async Task<ScanResult> ScanAsync(CancellationToken cancellationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromMinutes(2));
         try
         {
-            var result = await RunAsync(["list", "--upgrade-available"], timeout.Token);
+            var result = await run(["list", "--upgrade-available"], timeout.Token, null);
             if (result.ExitCode != 0 && result.ExitCode != unchecked((int)0x8A150014))
                 throw new InvalidOperationException($"WinGet 检查失败（{result.ExitCodeText}）。\n{result.Output}");
 
@@ -42,18 +48,77 @@ public sealed partial class WinGet : IUpdateProvider
         }
     }
 
-    public Task<CommandResult> UpgradeAsync(PackageUpdate package) =>
-        RunAsync(UpgradeArguments(package), CancellationToken.None);
-
-    public static string[] UpgradeArguments(PackageUpdate package)
+    public async Task<CommandResult> UpgradeAsync(PackageUpdate package)
     {
         if (!PackageIdPattern().IsMatch(package.Id) || !IsVersion(package.Available))
             throw new ArgumentException("WinGet 包 ID 或目标版本无效。");
 
-        return ["upgrade", "--id", package.Id, "--exact", "--version", package.Available];
+        var (installed, details) = await LocateAsync(package).ConfigureAwait(false);
+        if (installed is null)
+            return new CommandResult(null, $"无法确认唯一的原安装目录，已跳过更新。\n{details}");
+
+        var (installerType, installerDetails) = await GetInstallerTypeAsync(package).ConfigureAwait(false);
+        if (installerType is not ("inno" or "nullsoft" or "portable"))
+            return new CommandResult(null, $"无法确认安装器支持指定目录，已跳过更新。\n{installerDetails}");
+
+        var existing = installed.Executable is null ? [] : AppWindowCleanup.CaptureProcessIds();
+        using var installer = new InstallerProcessGroup();
+        DateTime started = DateTime.UtcNow;
+        var result = await run(
+            ["upgrade", "--id", package.Id, "--exact", "--version", package.Available,
+             "--installer-type", installerType, "--silent", "--location", installed.Directory],
+            CancellationToken.None, installer).ConfigureAwait(false);
+        var (closeMessage, windowNeedsReview) = await AppWindowCleanup
+            .CloseNewWindowsAsync(installed.Executable, existing, started, installer).ConfigureAwait(false);
+        string locationStatus = "";
+        if (result.ExitCode == 0)
+        {
+            var (updated, _) = await LocateAsync(package).ConfigureAwait(false);
+            if (updated is null)
+                locationStatus = "\n更新后无法核实安装目录，请在应用属性中检查。";
+            else if (!string.Equals(installed.Directory, updated.Directory, StringComparison.OrdinalIgnoreCase))
+                locationStatus = $"\n安装器报告的安装目录已变为 {updated.Directory}，请检查。";
+            else if (!string.Equals(updated.Version, package.Available, StringComparison.OrdinalIgnoreCase))
+                locationStatus = "\n登记的安装路径相同，但无法核实目标版本，请检查。";
+        }
+        return result with
+        {
+            Output = $"原安装目录：{installed.Directory}{locationStatus}\n{closeMessage}\n\n{result.Output}",
+            NeedsReview = locationStatus.Length > 0 || windowNeedsReview
+        };
     }
 
-    private static async Task<CommandResult> RunAsync(string[] arguments, CancellationToken cancellationToken)
+    private async Task<(InstalledApplication? Application, string Details)> LocateAsync(PackageUpdate package)
+    {
+        var result = await InspectAsync(["list", "--id", package.Id, "--exact", "--details"]).ConfigureAwait(false);
+        return (result.ExitCode == 0 ? InstalledApplication.FromDetails(package, result.Output) : null, result.Output);
+    }
+
+    private async Task<(string? Type, string Details)> GetInstallerTypeAsync(PackageUpdate package)
+    {
+        var result = await InspectAsync(["show", "--id", package.Id, "--exact", "--version", package.Available])
+            .ConfigureAwait(false);
+        string? type = result.ExitCode == 0
+            ? InstalledApplication.ReadField(result.Output.Split('\n'), "Installer Type", "安装程序类型", "安裝程式類型")?.ToLowerInvariant()
+            : null;
+        return (type, result.Output);
+    }
+
+    private async Task<CommandResult> InspectAsync(string[] arguments)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        try
+        {
+            return await run(arguments, timeout.Token, null).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            return new CommandResult(null, "WinGet 查询包信息超时。");
+        }
+    }
+
+    private static async Task<CommandResult> RunAsync(string[] arguments, CancellationToken cancellationToken,
+        InstallerProcessGroup? installer)
     {
         string winget = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "Microsoft", "WindowsApps", "winget.exe");
@@ -83,12 +148,13 @@ public sealed partial class WinGet : IUpdateProvider
             throw new InvalidOperationException("无法启动 WinGet。请检查 Windows 的应用安装程序（App Installer）和 winget.exe 执行别名。", ex);
         }
 
+        installer?.Attach(process);
         process.StandardInput.Close();
         var stdout = process.StandardOutput.ReadToEndAsync();
         var stderr = process.StandardError.ReadToEndAsync();
         try
         {
-            await process.WaitForExitAsync(cancellationToken);
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -97,7 +163,7 @@ public sealed partial class WinGet : IUpdateProvider
             throw;
         }
 
-        string output = CleanOutput(string.Concat(await stdout, "\n", await stderr));
+        string output = CleanOutput(string.Concat(await stdout.ConfigureAwait(false), "\n", await stderr.ConfigureAwait(false)));
         return new CommandResult(process.ExitCode, output);
     }
 
