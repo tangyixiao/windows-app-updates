@@ -1,0 +1,6 @@
+/WindowsAppUpdates.exe
+/package/
+**/bin/
+**/obj/
+.vs/
+*.user
