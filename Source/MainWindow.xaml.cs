@@ -168,6 +168,8 @@ public partial class MainWindow : Window
         SyncControls();
         int succeeded = 0;
         int failed = 0;
+        int skipped = 0;
+        int reviewCount = 0;
         try
         {
             foreach (var package in selected)
@@ -175,7 +177,7 @@ public partial class MainWindow : Window
                 if (stopRequested)
                     break;
 
-                SetStatus($"正在更新 {succeeded + failed + 1}/{selected.Length}　{package.Name}");
+                SetStatus($"正在处理 {succeeded + failed + skipped + 1}/{selected.Length}　{package.Name}");
                 CommandResult result;
                 try
                 {
@@ -186,10 +188,14 @@ public partial class MainWindow : Window
                     result = new CommandResult(ex.HResult, ex.Message);
                 }
 
-                if (result.ExitCode == 0)
+                if (result.ExitCode is null)
+                    skipped++;
+                else if (result.ExitCode == 0)
                     succeeded++;
                 else
                     failed++;
+                if (result.ExitCode == 0 && result.NeedsReview)
+                    reviewCount++;
                 RecordAttempt(package, result);
             }
         }
@@ -199,11 +205,15 @@ public partial class MainWindow : Window
             SyncControls();
         }
 
-        int remaining = selected.Length - succeeded - failed;
+        int remaining = selected.Length - succeeded - failed - skipped;
         string summary = $"WinGet 报告成功 {succeeded} 项，失败 {failed} 项";
+        if (skipped > 0)
+            summary += $"，跳过 {skipped} 项";
+        if (reviewCount > 0)
+            summary += $"，{reviewCount} 项需检查详情";
         if (remaining > 0)
             summary += $"，未执行 {remaining} 项";
-        if (failed > 0)
+        if (failed + skipped + reviewCount > 0)
             HistoryTab.IsChecked = true;
         await RefreshAsync(summary);
     }
@@ -217,9 +227,16 @@ public partial class MainWindow : Window
 
     private void RecordAttempt(PackageUpdate package, CommandResult result)
     {
-        string log = result.Output.Length > 8000 ? $"（仅显示末尾输出）\n{result.Output[^8000..]}" : result.Output;
+        string log = result.Output.Length > 8000 ? $"{result.Output[..8000]}\n（其余输出已省略）" : result.Output;
+        string outcome = result.ExitCode switch
+        {
+            null => "已跳过",
+            0 when result.NeedsReview => "需检查详情",
+            0 => "WinGet 报告成功",
+            _ => "失败"
+        };
         var entry = new UpdateEntry(DateTimeOffset.Now, package.Name, package.Id, package.Installed,
-            package.Available, result.ExitCode == 0 ? "WinGet 报告成功" : "失败",
+            package.Available, outcome,
             $"WinGet 退出代码 {result.ExitCodeText}\n\n{log}");
         history.Insert(0, entry);
         if (history.Count > 100)
@@ -309,7 +326,7 @@ public partial class MainWindow : Window
         var panel = new DockPanel { Margin = new Thickness(18) };
         var intro = new TextBlock
         {
-            Text = $"将依次更新 {selected.Length} 个应用。安装器可能要求确认或管理员权限。",
+            Text = $"将依次请求静默更新 {selected.Length} 个应用，并指定原安装目录。无法确认目录或安装器支持时会跳过。安装器可能要求管理员权限。",
             TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 12)
         };
         DockPanel.SetDock(intro, Dock.Top);
